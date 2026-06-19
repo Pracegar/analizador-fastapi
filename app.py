@@ -1,10 +1,12 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
+from urllib.parse import urlparse
 import os
 import time
 import base64
 import requests
+import re
 
 app = FastAPI()
 
@@ -22,13 +24,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VT_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
-URLSCAN_API_KEY = os.getenv("URLSCAN_API_KEY")
+VT_API_KEY = (os.getenv("VIRUSTOTAL_API_KEY") or "").strip()
+URLSCAN_API_KEY = (os.getenv("URLSCAN_API_KEY") or "").strip()
 
 
 def obtener_url_id_vt(url: str) -> str:
     url_bytes = url.encode("utf-8")
     return base64.urlsafe_b64encode(url_bytes).decode("utf-8").strip("=")
+
+
+def normalizar_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
+
+
+def extraer_urls(texto: Optional[str]) -> List[str]:
+    if not texto:
+        return []
+
+    patron = r'(https?://[^\s<>"\'()]+|www\.[^\s<>"\'()]+)'
+    encontrados = re.findall(patron, texto, flags=re.IGNORECASE)
+
+    urls_limpias = []
+    vistos = set()
+
+    for item in encontrados:
+        url = item.strip().rstrip(".,;)")
+        url = normalizar_url(url)
+        if url and url not in vistos:
+            vistos.add(url)
+            urls_limpias.append(url)
+
+    return urls_limpias
+
+
+def extraer_dominio_de_email(remitente: Optional[str]) -> Optional[str]:
+    if not remitente:
+        return None
+
+    match = re.search(r'([a-zA-Z0-9._%+-]+@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))', remitente)
+    if not match:
+        return None
+
+    dominio = match.group(2).lower().strip()
+    return dominio or None
+
+
+def extraer_dominio_de_url(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+        dominio = (parsed.netloc or "").lower().strip()
+        if dominio.startswith("www."):
+            dominio = dominio[4:]
+        return dominio or None
+    except Exception:
+        return None
 
 
 def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
@@ -83,7 +137,7 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
 
                 resultado["ok"] = True
                 resultado["stats"] = stats
-                resultado["detalle"] = "VirusTotal respondió correctamente."
+                resultado["detalle"] = "VirusTotal respondió correctamente para la URL."
 
                 if malicious > 0:
                     resultado["motivos"].append(
@@ -95,7 +149,7 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
                     )
                 else:
                     resultado["motivos"].append(
-                        f"VirusTotal respondió sin detecciones claras (harmless: {harmless}, undetected: {undetected})."
+                        f"VirusTotal respondió sin detecciones claras para la URL (harmless: {harmless}, undetected: {undetected})."
                     )
 
                 return resultado
@@ -106,7 +160,70 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
         return resultado
 
     except Exception as e:
-        resultado["detalle"] = f"Error consultando VirusTotal: {str(e)}"
+        resultado["detalle"] = f"Error consultando VirusTotal URL: {str(e)}"
+        return resultado
+
+
+def analizar_dominio_con_virustotal(dominio: str) -> Dict[str, Any]:
+    resultado = {
+        "usada": False,
+        "ok": False,
+        "detalle": "",
+        "motivos": [],
+        "stats": {},
+    }
+
+    if not VT_API_KEY:
+        resultado["detalle"] = "No existe VIRUSTOTAL_API_KEY en variables de entorno."
+        return resultado
+
+    headers = {
+        "x-apikey": VT_API_KEY,
+        "accept": "application/json",
+    }
+
+    try:
+        resp = requests.get(
+            f"https://www.virustotal.com/api/v3/domains/{dominio}",
+            headers=headers,
+            timeout=30,
+        )
+
+        resultado["usada"] = True
+
+        if resp.status_code != 200:
+            resultado["detalle"] = f"VirusTotal devolvió status {resp.status_code} al consultar el dominio."
+            return resultado
+
+        data = resp.json()
+        attrs = data.get("data", {}).get("attributes", {})
+        stats = attrs.get("last_analysis_stats", {})
+        malicious = stats.get("malicious", 0)
+        suspicious = stats.get("suspicious", 0)
+        harmless = stats.get("harmless", 0)
+        undetected = stats.get("undetected", 0)
+
+        resultado["ok"] = True
+        resultado["stats"] = stats
+        resultado["detalle"] = "VirusTotal respondió correctamente para el dominio."
+
+        if malicious > 0:
+            resultado["motivos"].append(
+                f"VirusTotal marcó el dominio {dominio} como malicioso en {malicious} motores."
+            )
+        elif suspicious > 0:
+            resultado["motivos"].append(
+                f"VirusTotal marcó el dominio {dominio} como sospechoso en {suspicious} motores."
+            )
+        else:
+            resultado["motivos"].append(
+                f"VirusTotal respondió sin detecciones claras para el dominio {dominio} (harmless: {harmless}, undetected: {undetected})."
+            )
+
+        return resultado
+
+    except Exception as e:
+        resultado["detalle"] = f"Error consultando VirusTotal dominio: {str(e)}"
         return resultado
 
 
@@ -220,24 +337,30 @@ async def analizar_correo(
     motivos: List[str] = []
     puntos = 0
 
-    vt_resultado = {
-        "usada": False,
-        "ok": False,
-        "detalle": "No se consultó VirusTotal.",
-    }
-    urlscan_resultado = {
-        "usada": False,
-        "ok": False,
-        "detalle": "No se consultó urlscan.io.",
-    }
+    urls_detectadas: List[str] = []
+    dominios_detectados: Set[str] = set()
 
-    dominios_internos = ["@pracegar.com", "@haceb.com"]
-    if remitente and not any(d in remitente.lower() for d in dominios_internos):
-        puntos += 2
-        motivos.append("El remitente no parece ser del dominio de la empresa.")
+    debug_vt_urls = []
+    debug_vt_dominios = []
+    debug_urlscan_urls = []
 
-    if asunto:
-        asunto_lower = asunto.lower()
+    dominios_internos = ["pracegar.com", "haceb.com"]
+
+    remitente_limpio = (remitente or "").strip()
+    asunto_limpio = (asunto or "").strip()
+    cuerpo_limpio = (cuerpo or "").strip()
+    url_limpia = normalizar_url((url or "").strip()) if url else ""
+
+    dominio_remitente = extraer_dominio_de_email(remitente_limpio)
+    if dominio_remitente:
+        dominios_detectados.add(dominio_remitente)
+
+        if dominio_remitente not in dominios_internos:
+            puntos += 2
+            motivos.append("El remitente no parece ser del dominio de la empresa.")
+
+    if asunto_limpio:
+        asunto_lower = asunto_limpio.lower()
         palabras_peligrosas = [
             "urgente",
             "bloqueo",
@@ -254,41 +377,8 @@ async def analizar_correo(
                 "El asunto contiene palabras de urgencia o relacionadas con pagos/seguridad."
             )
 
-    if url:
-        url_lower = url.lower()
-
-        if url_lower.startswith("http://"):
-            puntos += 3
-            motivos.append("La URL usa http en lugar de https.")
-
-        if "login" in url_lower or "verifica" in url_lower or "cuenta" in url_lower:
-            puntos += 2
-            motivos.append(
-                "La URL parece relacionada con inicio de sesión o verificación de cuenta."
-            )
-
-        vt_resultado = analizar_url_con_virustotal(url)
-        motivos.extend(vt_resultado.get("motivos", []))
-
-        for m in vt_resultado.get("motivos", []):
-            m_lower = m.lower()
-            if "maliciosa" in m_lower:
-                puntos += 4
-            elif "sospechosa" in m_lower:
-                puntos += 2
-
-        urlscan_resultado = analizar_url_con_urlscan(url)
-        motivos.extend(urlscan_resultado.get("motivos", []))
-
-        for m in urlscan_resultado.get("motivos", []):
-            m_lower = m.lower()
-            if "maliciosa" in m_lower:
-                puntos += 4
-            elif "riesgo" in m_lower:
-                puntos += 2
-
-    if cuerpo:
-        cuerpo_lower = cuerpo.lower()
+    if cuerpo_limpio:
+        cuerpo_lower = cuerpo_limpio.lower()
         if (
             "cambiar cuenta" in cuerpo_lower
             or "número de cuenta" in cuerpo_lower
@@ -301,6 +391,78 @@ async def analizar_correo(
             motivos.append(
                 "El cuerpo menciona cambios de cuenta o datos financieros/sensibles."
             )
+
+    if url_limpia:
+        urls_detectadas.append(url_limpia)
+
+    urls_en_cuerpo = extraer_urls(cuerpo_limpio)
+    for u in urls_en_cuerpo:
+        if u not in urls_detectadas:
+            urls_detectadas.append(u)
+
+    for u in urls_detectadas:
+        dominio = extraer_dominio_de_url(u)
+        if dominio:
+            dominios_detectados.add(dominio)
+
+        u_lower = u.lower()
+
+        if u_lower.startswith("http://"):
+            puntos += 3
+            motivos.append(f"La URL {u} usa http en lugar de https.")
+
+        if "login" in u_lower or "verifica" in u_lower or "cuenta" in u_lower:
+            puntos += 2
+            motivos.append(
+                f"La URL {u} parece relacionada con inicio de sesión o verificación de cuenta."
+            )
+
+    for dominio in dominios_detectados:
+        vt_dominio = analizar_dominio_con_virustotal(dominio)
+        debug_vt_dominios.append({
+            "dominio": dominio,
+            "resultado": vt_dominio,
+        })
+
+        motivos.extend(vt_dominio.get("motivos", []))
+
+        for m in vt_dominio.get("motivos", []):
+            m_lower = m.lower()
+            if "malicioso" in m_lower:
+                puntos += 4
+            elif "sospechoso" in m_lower:
+                puntos += 2
+
+    for u in urls_detectadas:
+        vt_url = analizar_url_con_virustotal(u)
+        debug_vt_urls.append({
+            "url": u,
+            "resultado": vt_url,
+        })
+
+        motivos.extend(vt_url.get("motivos", []))
+
+        for m in vt_url.get("motivos", []):
+            m_lower = m.lower()
+            if "maliciosa" in m_lower:
+                puntos += 4
+            elif "sospechosa" in m_lower:
+                puntos += 2
+
+        urlscan_url = analizar_url_con_urlscan(u)
+        debug_urlscan_urls.append({
+            "url": u,
+            "resultado": urlscan_url,
+        })
+
+        motivos.extend(urlscan_url.get("motivos", []))
+
+        for m in urlscan_url.get("motivos", []):
+            m_lower = m.lower()
+            if "maliciosa" in m_lower:
+                puntos += 4
+            elif "riesgo" in m_lower:
+                puntos += 2
 
     if archivo is not None and archivo.filename:
         puntos += 1
@@ -324,12 +486,11 @@ async def analizar_correo(
         "riesgo": riesgo,
         "motivos": motivos,
         "debug": {
-            "usa_vt": vt_resultado.get("usada", False),
-            "vt_ok": vt_resultado.get("ok", False),
-            "vt_detalle": vt_resultado.get("detalle", ""),
-            "usa_urlscan": urlscan_resultado.get("usada", False),
-            "urlscan_ok": urlscan_resultado.get("ok", False),
-            "urlscan_detalle": urlscan_resultado.get("detalle", ""),
+            "urls_detectadas": urls_detectadas,
+            "dominios_detectados": sorted(list(dominios_detectados)),
+            "vt_urls": debug_vt_urls,
+            "vt_dominios": debug_vt_dominios,
+            "urlscan_urls": debug_urlscan_urls,
             "vt_key_cargada": bool(VT_API_KEY),
             "urlscan_key_cargada": bool(URLSCAN_API_KEY),
         },
