@@ -149,6 +149,7 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
         "detalle": "",
         "motivos": [],
         "stats": {},
+        "risk_points": 0,
     }
 
     if not VT_API_KEY:
@@ -197,14 +198,17 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
                 resultado["detalle"] = "VirusTotal respondió correctamente para la URL."
 
                 if malicious > 0:
+                    resultado["risk_points"] = 6
                     resultado["motivos"].append(
                         f"VirusTotal marcó la URL como maliciosa en {malicious} motores."
                     )
                 elif suspicious > 0:
+                    resultado["risk_points"] = 3
                     resultado["motivos"].append(
                         f"VirusTotal marcó la URL como sospechosa en {suspicious} motores."
                     )
                 else:
+                    resultado["risk_points"] = 0
                     resultado["motivos"].append(
                         f"VirusTotal respondió sin detecciones claras para la URL (harmless: {harmless}, undetected: {undetected})."
                     )
@@ -228,6 +232,7 @@ def analizar_dominio_con_virustotal(dominio: str) -> Dict[str, Any]:
         "detalle": "",
         "motivos": [],
         "stats": {},
+        "risk_points": 0,
     }
 
     if not VT_API_KEY:
@@ -265,14 +270,17 @@ def analizar_dominio_con_virustotal(dominio: str) -> Dict[str, Any]:
         resultado["detalle"] = "VirusTotal respondió correctamente para el dominio."
 
         if malicious > 0:
+            resultado["risk_points"] = 4
             resultado["motivos"].append(
                 f"VirusTotal marcó el dominio {dominio} como malicioso en {malicious} motores."
             )
         elif suspicious > 0:
+            resultado["risk_points"] = 2
             resultado["motivos"].append(
                 f"VirusTotal marcó el dominio {dominio} como sospechoso en {suspicious} motores."
             )
         else:
+            resultado["risk_points"] = 0
             resultado["motivos"].append(
                 f"VirusTotal respondió sin detecciones claras para el dominio {dominio} (harmless: {harmless}, undetected: {undetected})."
             )
@@ -292,6 +300,7 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
         "motivos": [],
         "uuid": None,
         "score": None,
+        "risk_points": 0,
     }
 
     if not URLSCAN_API_KEY:
@@ -349,14 +358,17 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
                 resultado["detalle"] = "urlscan.io respondió correctamente."
 
                 if malicious:
+                    resultado["risk_points"] = 5
                     resultado["motivos"].append(
                         f"urlscan.io marcó la página como potencialmente maliciosa (score {score})."
                     )
                 elif score and score > 0:
+                    resultado["risk_points"] = 2
                     resultado["motivos"].append(
                         f"urlscan.io detectó señales de riesgo en la página (score {score})."
                     )
                 else:
+                    resultado["risk_points"] = 0
                     resultado["motivos"].append(
                         "urlscan.io respondió sin señales fuertes de riesgo."
                     )
@@ -487,15 +499,7 @@ async def analizar_correo(
         )
 
         motivos.extend(vt_dominio.get("motivos", []))
-
-        puntaje_dominio = 0
-        for m in vt_dominio.get("motivos", []):
-            m_lower = m.lower()
-            if "malicioso" in m_lower:
-                puntaje_dominio = max(puntaje_dominio, 4)
-            elif "sospechoso" in m_lower:
-                puntaje_dominio = max(puntaje_dominio, 2)
-        puntos += puntaje_dominio
+        puntos += vt_dominio.get("risk_points", 0)
 
     for u in urls_detectadas:
         vt_url = analizar_url_con_virustotal(u)
@@ -506,6 +510,7 @@ async def analizar_correo(
             }
         )
         motivos.extend(vt_url.get("motivos", []))
+        puntos += vt_url.get("risk_points", 0)
 
         urlscan_url = analizar_url_con_urlscan(u)
         debug_urlscan_urls.append(
@@ -515,15 +520,7 @@ async def analizar_correo(
             }
         )
         motivos.extend(urlscan_url.get("motivos", []))
-
-        puntaje_url = 0
-        for m in vt_url.get("motivos", []) + urlscan_url.get("motivos", []):
-            m_lower = m.lower()
-            if "maliciosa" in m_lower:
-                puntaje_url = max(puntaje_url, 6)
-            elif "riesgo" in m_lower or "sospechosa" in m_lower:
-                puntaje_url = max(puntaje_url, 3)
-        puntos += puntaje_url
+        puntos += urlscan_url.get("risk_points", 0)
 
     if archivo_info:
         puntos += 1
