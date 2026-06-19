@@ -405,13 +405,14 @@ async def analizar_correo(
         if dominio:
             dominios_detectados.add(dominio)
 
+    for u in urls_detectadas:
         u_lower = u.lower()
 
         if u_lower.startswith("http://"):
-            puntos += 3
+            puntos += 2
             motivos.append(f"La URL {u} usa http en lugar de https.")
 
-        if "login" in u_lower or "verifica" in u_lower or "cuenta" in u_lower:
+        if any(p in u_lower for p in ["login", "verifica", "cuenta"]):
             puntos += 2
             motivos.append(
                 f"La URL {u} parece relacionada con inicio de sesión o verificación de cuenta."
@@ -419,50 +420,51 @@ async def analizar_correo(
 
     for dominio in dominios_detectados:
         vt_dominio = analizar_dominio_con_virustotal(dominio)
-        debug_vt_dominios.append({
-            "dominio": dominio,
-            "resultado": vt_dominio,
-        })
+        debug_vt_dominios.append(
+            {
+                "dominio": dominio,
+                "resultado": vt_dominio,
+            }
+        )
 
         motivos.extend(vt_dominio.get("motivos", []))
 
+        puntaje_dominio = 0
         for m in vt_dominio.get("motivos", []):
             m_lower = m.lower()
             if "malicioso" in m_lower:
-                puntos += 4
+                puntaje_dominio = max(puntaje_dominio, 4)
             elif "sospechoso" in m_lower:
-                puntos += 2
+                puntaje_dominio = max(puntaje_dominio, 2)
+        puntos += puntaje_dominio
 
     for u in urls_detectadas:
         vt_url = analizar_url_con_virustotal(u)
-        debug_vt_urls.append({
-            "url": u,
-            "resultado": vt_url,
-        })
-
+        debug_vt_urls.append(
+            {
+                "url": u,
+                "resultado": vt_url,
+            }
+        )
         motivos.extend(vt_url.get("motivos", []))
 
-        for m in vt_url.get("motivos", []):
-            m_lower = m.lower()
-            if "maliciosa" in m_lower:
-                puntos += 4
-            elif "sospechosa" in m_lower:
-                puntos += 2
-
         urlscan_url = analizar_url_con_urlscan(u)
-        debug_urlscan_urls.append({
-            "url": u,
-            "resultado": urlscan_url,
-        })
-
+        debug_urlscan_urls.append(
+            {
+                "url": u,
+                "resultado": urlscan_url,
+            }
+        )
         motivos.extend(urlscan_url.get("motivos", []))
 
-        for m in urlscan_url.get("motivos", []):
+        puntaje_url = 0
+        for m in vt_url.get("motivos", []) + urlscan_url.get("motivos", []):
             m_lower = m.lower()
             if "maliciosa" in m_lower:
-                puntos += 4
-            elif "riesgo" in m_lower:
-                puntos += 2
+                puntaje_url = max(puntaje_url, 6)
+            elif "riesgo" in m_lower or "sospechosa" in m_lower:
+                puntaje_url = max(puntaje_url, 3)
+        puntos += puntaje_url
 
     if archivo is not None and archivo.filename:
         puntos += 1
@@ -493,5 +495,6 @@ async def analizar_correo(
             "urlscan_urls": debug_urlscan_urls,
             "vt_key_cargada": bool(VT_API_KEY),
             "urlscan_key_cargada": bool(URLSCAN_API_KEY),
+            "puntos_totales": puntos,
         },
     }
