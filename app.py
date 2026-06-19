@@ -10,6 +10,7 @@ import time
 import base64
 import requests
 import re
+from bs4 import BeautifulSoup
 
 try:
     import extract_msg
