@@ -50,9 +50,6 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
     }
 
     try:
-        print("=== VirusTotal ===")
-        print("Enviando URL a VirusTotal:", url)
-
         submit = requests.post(
             "https://www.virustotal.com/api/v3/urls",
             headers=headers,
@@ -61,7 +58,6 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
         )
 
         resultado["usada"] = True
-        print("VirusTotal submit status:", submit.status_code)
 
         if submit.status_code not in [200, 202]:
             resultado["detalle"] = f"VirusTotal devolvió status {submit.status_code} al enviar la URL."
@@ -69,15 +65,12 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
 
         url_id = obtener_url_id_vt(url)
 
-        # Reintentamos varias veces porque el análisis puede no estar listo de inmediato
-        for intento in range(1, 6):
-            print(f"Consultando reporte VT intento {intento} para URL ID {url_id}")
+        for _ in range(5):
             report = requests.get(
                 f"https://www.virustotal.com/api/v3/urls/{url_id}",
                 headers=headers,
                 timeout=30,
             )
-            print("VirusTotal report status:", report.status_code)
 
             if report.status_code == 200:
                 data = report.json()
@@ -113,7 +106,6 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
         return resultado
 
     except Exception as e:
-        print("Error en VirusTotal:", str(e))
         resultado["detalle"] = f"Error consultando VirusTotal: {str(e)}"
         return resultado
 
@@ -138,9 +130,6 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
     }
 
     try:
-        print("=== urlscan.io ===")
-        print("Enviando URL a urlscan:", url)
-
         submit = requests.post(
             "https://urlscan.io/api/v1/scan/",
             headers=headers,
@@ -152,7 +141,6 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
         )
 
         resultado["usada"] = True
-        print("urlscan submit status:", submit.status_code)
 
         if submit.status_code != 200:
             resultado["detalle"] = f"urlscan.io devolvió status {submit.status_code} al enviar la URL."
@@ -166,17 +154,12 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
             resultado["detalle"] = "urlscan.io no devolvió UUID."
             return resultado
 
-        # urlscan puede tardar más; hacemos polling
-        for intento in range(1, 9):
-            print(f"Consultando resultado urlscan intento {intento}, uuid: {uuid}")
-
+        for _ in range(8):
             result = requests.get(
                 f"https://urlscan.io/api/v1/result/{uuid}/",
                 headers={"API-Key": URLSCAN_API_KEY},
                 timeout=30,
             )
-
-            print("urlscan result status:", result.status_code)
 
             if result.status_code == 200:
                 data = result.json()
@@ -217,7 +200,6 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
         return resultado
 
     except Exception as e:
-        print("Error en urlscan:", str(e))
         resultado["detalle"] = f"Error consultando urlscan.io: {str(e)}"
         return resultado
 
