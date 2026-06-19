@@ -346,7 +346,6 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
 
             if result.status_code == 200:
                 data = result.json()
-
                 verdicts = data.get("verdicts", {})
                 overall = verdicts.get("overall", {})
                 brands = verdicts.get("brands", [])
@@ -390,6 +389,128 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
         return resultado
 
 
+async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]:
+    resultado = {
+        "usada": False,
+        "ok": False,
+        "detalle": "",
+        "motivos": [],
+        "analysis_id": None,
+        "sha256": None,
+        "stats": {},
+        "risk_points": 0,
+    }
+
+    if not VT_API_KEY:
+        resultado["detalle"] = "No existe VIRUSTOTAL_API_KEY en variables de entorno."
+        return resultado
+
+    headers = {
+        "x-apikey": VT_API_KEY,
+        "accept": "application/json",
+    }
+
+    try:
+        contenido = await archivo.read()
+        await archivo.seek(0)
+
+        files = {
+            "file": (
+                archivo.filename,
+                contenido,
+                archivo.content_type or "application/octet-stream",
+            )
+        }
+
+        submit = requests.post(
+            "https://www.virustotal.com/api/v3/files",
+            headers=headers,
+            files=files,
+            timeout=60,
+        )
+
+        resultado["usada"] = True
+
+        if submit.status_code not in [200, 202]:
+            resultado["detalle"] = f"VirusTotal devolvió status {submit.status_code} al subir el archivo."
+            return resultado
+
+        submit_data = submit.json()
+        analysis_id = submit_data.get("data", {}).get("id")
+        resultado["analysis_id"] = analysis_id
+
+        if not analysis_id:
+            resultado["detalle"] = "VirusTotal no devolvió analysis_id para el archivo."
+            return resultado
+
+        for _ in range(8):
+            analysis_resp = requests.get(
+                f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+                headers=headers,
+                timeout=30,
+            )
+
+            if analysis_resp.status_code == 200:
+                analysis_data = analysis_resp.json()
+                attrs = analysis_data.get("data", {}).get("attributes", {})
+                status = attrs.get("status")
+
+                if status != "completed":
+                    time.sleep(4)
+                    continue
+
+                item_resp = requests.get(
+                    f"https://www.virustotal.com/api/v3/analyses/{analysis_id}/item",
+                    headers=headers,
+                    timeout=30,
+                )
+
+                if item_resp.status_code != 200:
+                    resultado["detalle"] = "VirusTotal completó el análisis del archivo, pero no devolvió el reporte final."
+                    return resultado
+
+                item_data = item_resp.json()
+                item_attrs = item_data.get("data", {}).get("attributes", {})
+                stats = item_attrs.get("last_analysis_stats", {})
+                sha256 = item_attrs.get("sha256")
+                malicious = stats.get("malicious", 0)
+                suspicious = stats.get("suspicious", 0)
+                harmless = stats.get("harmless", 0)
+                undetected = stats.get("undetected", 0)
+
+                resultado["ok"] = True
+                resultado["sha256"] = sha256
+                resultado["stats"] = stats
+                resultado["detalle"] = "VirusTotal respondió correctamente para el archivo."
+
+                if malicious > 0:
+                    resultado["risk_points"] = 6
+                    resultado["motivos"].append(
+                        f"VirusTotal marcó el archivo como malicioso en {malicious} motores."
+                    )
+                elif suspicious > 0:
+                    resultado["risk_points"] = 3
+                    resultado["motivos"].append(
+                        f"VirusTotal marcó el archivo como sospechoso en {suspicious} motores."
+                    )
+                else:
+                    resultado["risk_points"] = 0
+                    resultado["motivos"].append(
+                        f"VirusTotal respondió sin detecciones claras para el archivo (harmless: {harmless}, undetected: {undetected})."
+                    )
+
+                return resultado
+
+            time.sleep(4)
+
+        resultado["detalle"] = "VirusTotal aceptó el archivo, pero no devolvió un reporte listo a tiempo."
+        return resultado
+
+    except Exception as e:
+        resultado["detalle"] = f"Error consultando VirusTotal archivo: {str(e)}"
+        return resultado
+
+
 @app.get("/")
 async def root():
     return {"mensaje": "API de análisis de correos funcionando"}
@@ -412,6 +533,7 @@ async def analizar_correo(
     debug_vt_urls = []
     debug_vt_dominios = []
     debug_urlscan_urls = []
+    debug_vt_archivo = None
 
     dominios_internos = ["pracegar.com", "haceb.com"]
 
@@ -497,7 +619,6 @@ async def analizar_correo(
                 "resultado": vt_dominio,
             }
         )
-
         motivos.extend(vt_dominio.get("motivos", []))
         puntos += vt_dominio.get("risk_points", 0)
 
@@ -522,11 +643,12 @@ async def analizar_correo(
         motivos.extend(urlscan_url.get("motivos", []))
         puntos += urlscan_url.get("risk_points", 0)
 
-    if archivo_info:
-        puntos += 1
-        motivos.append(
-            f"Hay un archivo adjunto válido ({archivo_info['filename']}). Esta versión aún no analiza el archivo con motores externos."
-        )
+    if archivo_info and archivo:
+        vt_archivo = await analizar_archivo_con_virustotal(archivo)
+        debug_vt_archivo = vt_archivo
+        motivos.append(f"Hay un archivo adjunto válido ({archivo_info['filename']}).")
+        motivos.extend(vt_archivo.get("motivos", []))
+        puntos += vt_archivo.get("risk_points", 0)
 
     if puntos <= 2:
         riesgo = "bajo"
@@ -549,6 +671,7 @@ async def analizar_correo(
             "vt_urls": debug_vt_urls,
             "vt_dominios": debug_vt_dominios,
             "urlscan_urls": debug_urlscan_urls,
+            "vt_archivo": debug_vt_archivo,
             "vt_key_cargada": bool(VT_API_KEY),
             "urlscan_key_cargada": bool(URLSCAN_API_KEY),
             "archivo_info": archivo_info,
