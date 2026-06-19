@@ -4,18 +4,24 @@ from typing import Optional, List
 
 app = FastAPI()
 
-# Orígenes permitidos (tu frontend en Vercel)
+# Orígenes permitidos
 origins = [
     "https://analizador-correos.pracegar.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    return {"mensaje": "API de análisis de correos funcionando"}
 
 @app.post("/analizar-correo")
 async def analizar_correo(
@@ -30,7 +36,7 @@ async def analizar_correo(
 
     # Regla 1: remitente externo raro
     dominios_internos = ["@pracegar.com", "@haceb.com"]
-    if remitente and not any(d in remitente for d in dominios_internos):
+    if remitente and not any(d in remitente.lower() for d in dominios_internos):
         puntos += 2
         motivos.append("El remitente no parece ser del dominio de la empresa.")
 
@@ -65,7 +71,7 @@ async def analizar_correo(
                 "La URL parece relacionada con inicio de sesión o verificación de cuenta."
             )
 
-    # Regla 4: cuerpo con cambios de cuenta / datos sensibles
+    # Regla 4: cuerpo con cambios de cuenta o datos sensibles
     if cuerpo:
         cuerpo_lower = cuerpo.lower()
         if (
@@ -82,11 +88,10 @@ async def analizar_correo(
             )
 
     # Regla 5: archivo adjunto presente
-    if archivo is not None:
+    if archivo is not None and archivo.filename:
         motivos.append(
             f"Hay un archivo adjunto ({archivo.filename}). Esta versión todavía no lo analiza automáticamente."
         )
-        # Aquí en el futuro podrás leerlo y pasarlo a VirusTotal u otros servicios
 
     # Asignar nivel de riesgo
     if puntos <= 2:
