@@ -1,4 +1,5 @@
 fastapi
 uvicorn
-requests
 python-multipart
+requests
+extract-msg
