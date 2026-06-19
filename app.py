@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any, Set
 from urllib.parse import urlparse
@@ -26,6 +26,19 @@ app.add_middleware(
 
 VT_API_KEY = (os.getenv("VIRUSTOTAL_API_KEY") or "").strip()
 URLSCAN_API_KEY = (os.getenv("URLSCAN_API_KEY") or "").strip()
+
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".eml", ".msg"}
+ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "message/rfc822",
+    "application/vnd.ms-outlook",
+    "application/octet-stream",
+}
 
 
 def obtener_url_id_vt(url: str) -> str:
@@ -83,6 +96,50 @@ def extraer_dominio_de_url(url: str) -> Optional[str]:
         return dominio or None
     except Exception:
         return None
+
+
+async def validar_archivo(archivo: Optional[UploadFile]) -> Optional[Dict[str, Any]]:
+    if not archivo or not archivo.filename:
+        return None
+
+    filename = archivo.filename.strip()
+    filename_lower = filename.lower()
+
+    extension = ""
+    if "." in filename_lower:
+        extension = "." + filename_lower.split(".")[-1]
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Tipo de archivo no permitido. Solo se aceptan PDF, JPG, JPEG, PNG, EML o MSG."
+        )
+
+    content_type = (archivo.content_type or "").lower().strip()
+    if content_type and content_type not in ALLOWED_CONTENT_TYPES:
+        if extension != ".msg":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tipo MIME no permitido: {content_type}"
+            )
+
+    contenido = await archivo.read()
+    tamano = len(contenido)
+
+    if tamano > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo excede el tamaño máximo permitido de 5 MB."
+        )
+
+    await archivo.seek(0)
+
+    return {
+        "filename": filename,
+        "content_type": content_type,
+        "size_bytes": tamano,
+        "extension": extension,
+    }
 
 
 def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
@@ -351,6 +408,8 @@ async def analizar_correo(
     cuerpo_limpio = (cuerpo or "").strip()
     url_limpia = normalizar_url((url or "").strip()) if url else ""
 
+    archivo_info = await validar_archivo(archivo)
+
     dominio_remitente = extraer_dominio_de_email(remitente_limpio)
     if dominio_remitente:
         dominios_detectados.add(dominio_remitente)
@@ -466,10 +525,10 @@ async def analizar_correo(
                 puntaje_url = max(puntaje_url, 3)
         puntos += puntaje_url
 
-    if archivo is not None and archivo.filename:
+    if archivo_info:
         puntos += 1
         motivos.append(
-            f"Hay un archivo adjunto ({archivo.filename}). Esta versión aún no analiza el archivo con motores externos."
+            f"Hay un archivo adjunto válido ({archivo_info['filename']}). Esta versión aún no analiza el archivo con motores externos."
         )
 
     if puntos <= 2:
@@ -495,6 +554,7 @@ async def analizar_correo(
             "urlscan_urls": debug_urlscan_urls,
             "vt_key_cargada": bool(VT_API_KEY),
             "urlscan_key_cargada": bool(URLSCAN_API_KEY),
+            "archivo_info": archivo_info,
             "puntos_totales": puntos,
         },
     }
