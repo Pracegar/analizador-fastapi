@@ -144,218 +144,60 @@ def limpiar_texto_html(texto: str) -> str:
     return texto.strip()
 
 
-def extraer_texto_eml_desde_bytes(contenido: bytes) -> Dict[str, Any]:
-    resultado = {
-        "subject": "",
-        "from": "",
-        "body": "",
-        "urls": [],
-        "dominios": [],
-    }
+def recortar_texto(texto: str, max_len: int = 140) -> str:
+    texto = (texto or "").strip()
+    if len(texto) <= max_len:
+        return texto
+    return texto[:max_len].rstrip() + "..."
 
-    try:
-        msg = message_from_bytes(contenido, policy=default)
-        resultado["subject"] = str(msg.get("subject") or "").strip()
-        resultado["from"] = str(msg.get("from") or "").strip()
 
-        partes_texto = []
-        urls_html = []
+def generar_resumen_usuario(
+    riesgo: str,
+    remitente: str,
+    urls_detectadas: List[str],
+    archivo_info: Optional[Dict[str, Any]],
+    archivo_extraido: Optional[Dict[str, Any]],
+    puntos: int
+) -> List[str]:
+    resumen = []
 
-        if msg.is_multipart():
-            for part in msg.walk():
-                content_type = part.get_content_type()
-                disposition = str(part.get("Content-Disposition") or "").lower()
+    if riesgo == "alto":
+        resumen.append("Este correo presenta varias señales de riesgo y se recomienda no interactuar con enlaces ni adjuntos.")
+    elif riesgo == "medio":
+        resumen.append("Este correo presenta algunas señales de precaución y conviene revisarlo antes de confiar en su contenido.")
+    else:
+        resumen.append("No se detectaron señales fuertes de riesgo, pero igual conviene revisar el mensaje con atención.")
 
-                if "attachment" in disposition:
-                    continue
+    dominio_remitente = extraer_dominio_de_email(remitente)
+    if dominio_remitente:
+        resumen.append(f"El remitente visible pertenece al dominio {dominio_remitente}.")
 
-                try:
-                    if content_type == "text/plain":
-                        texto = part.get_content()
-                        if texto:
-                            partes_texto.append(str(texto))
-
-                    elif content_type == "text/html":
-                        html = part.get_content()
-                        if html:
-                            html_str = str(html)
-                            partes_texto.append(limpiar_texto_html(html_str))
-                            urls_html.extend(extraer_links_html(html_str))
-                except Exception:
-                    continue
+    if urls_detectadas:
+        if len(urls_detectadas) == 1:
+            resumen.append("Se detectó 1 enlace en el correo o en el adjunto.")
         else:
-            try:
-                contenido_simple = msg.get_content()
-                if contenido_simple:
-                    if msg.get_content_type() == "text/html":
-                        html_str = str(contenido_simple)
-                        partes_texto.append(limpiar_texto_html(html_str))
-                        urls_html.extend(extraer_links_html(html_str))
-                    else:
-                        partes_texto.append(str(contenido_simple))
-            except Exception:
-                pass
+            resumen.append(f"Se detectaron {len(urls_detectadas)} enlaces en el correo o en el adjunto.")
 
-        body = "\n".join([p for p in partes_texto if p]).strip()
-        resultado["body"] = body
-
-        urls_texto = extraer_urls(
-            " ".join(
-                [
-                    resultado["subject"],
-                    resultado["from"],
-                    resultado["body"],
-                ]
-            )
+        url_sospechosa = next(
+            (
+                u for u in urls_detectadas
+                if any(p in u.lower() for p in ["login", "verifica", "cuenta", "confirm"])
+            ),
+            None
         )
+        if url_sospechosa:
+            resumen.append("Al menos uno de los enlaces parece de confirmación, verificación o acceso a cuenta.")
 
-        urls_finales = []
-        vistos = set()
+    if archivo_info:
+        resumen.append(f"Se analizó un archivo adjunto válido: {archivo_info.get('filename', 'archivo')}.")
 
-        for u in urls_html + urls_texto:
-            if u and u not in vistos:
-                vistos.add(u)
-                urls_finales.append(u)
+    if archivo_extraido and archivo_extraido.get("from"):
+        resumen.append("Se pudo extraer información interna del correo adjunto para enriquecer el análisis.")
 
-        resultado["urls"] = urls_finales
+    if puntos >= 6:
+        resumen.append("La recomendación es tratar este mensaje como sospechoso hasta validarlo por otro medio.")
 
-        dominios = set()
-        dom_from = extraer_dominio_de_email(resultado["from"])
-        if dom_from:
-            dominios.add(dom_from)
-
-        for u in urls_finales:
-            dom = extraer_dominio_de_url(u)
-            if dom:
-                dominios.add(dom)
-
-        resultado["dominios"] = sorted(list(dominios))
-        return resultado
-
-    except Exception:
-        return resultado
-
-
-def extraer_texto_msg_desde_bytes(contenido: bytes) -> Dict[str, Any]:
-    resultado = {
-        "subject": "",
-        "from": "",
-        "body": "",
-        "urls": [],
-        "dominios": [],
-    }
-
-    if extract_msg is None:
-        return resultado
-
-    ruta_temp = None
-
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as tmp:
-            tmp.write(contenido)
-            ruta_temp = tmp.name
-
-        msg = extract_msg.Message(ruta_temp)
-
-        resultado["subject"] = str(getattr(msg, "subject", "") or "").strip()
-        resultado["from"] = str(getattr(msg, "sender", "") or "").strip()
-        resultado["body"] = str(getattr(msg, "body", "") or "").strip()
-
-        urls_texto = extraer_urls(
-            " ".join(
-                [
-                    resultado["subject"],
-                    resultado["from"],
-                    resultado["body"],
-                ]
-            )
-        )
-
-        resultado["urls"] = urls_texto
-
-        dominios = set()
-        dom_from = extraer_dominio_de_email(resultado["from"])
-        if dom_from:
-            dominios.add(dom_from)
-
-        for u in urls_texto:
-            dom = extraer_dominio_de_url(u)
-            if dom:
-                dominios.add(dom)
-
-        resultado["dominios"] = sorted(list(dominios))
-        return resultado
-
-    except Exception:
-        return resultado
-
-    finally:
-        if ruta_temp and os.path.exists(ruta_temp):
-            try:
-                os.remove(ruta_temp)
-            except Exception:
-                pass
-
-
-async def extraer_datos_desde_archivo_correo(archivo: Optional[UploadFile]) -> Optional[Dict[str, Any]]:
-    if not archivo or not archivo.filename:
-        return None
-
-    filename = archivo.filename.lower().strip()
-    contenido = await archivo.read()
-    await archivo.seek(0)
-
-    if filename.endswith(".eml"):
-        return extraer_texto_eml_desde_bytes(contenido)
-
-    if filename.endswith(".msg"):
-        return extraer_texto_msg_desde_bytes(contenido)
-
-    return None
-
-
-async def validar_archivo(archivo: Optional[UploadFile]) -> Optional[Dict[str, Any]]:
-    if not archivo or not archivo.filename:
-        return None
-
-    filename = archivo.filename.strip()
-    filename_lower = filename.lower()
-
-    extension = ""
-    if "." in filename_lower:
-        extension = "." + filename_lower.split(".")[-1]
-
-    if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail="Tipo de archivo no permitido. Solo se aceptan PDF, JPG, JPEG, PNG, EML o MSG."
-        )
-
-    content_type = (archivo.content_type or "").lower().strip()
-    if content_type and content_type not in ALLOWED_CONTENT_TYPES:
-        if extension != ".msg":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Tipo MIME no permitido: {content_type}"
-            )
-
-    contenido = await archivo.read()
-    tamano = len(contenido)
-
-    if tamano > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail="El archivo excede el tamaño máximo permitido de 5 MB."
-        )
-
-    await archivo.seek(0)
-
-    return {
-        "filename": filename,
-        "content_type": content_type,
-        "size_bytes": tamano,
-        "extension": extension,
-    }
+    return resumen[:5]
 
 
 def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
@@ -759,6 +601,95 @@ async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]
         return resultado
 
 
+def construir_motivos_visibles(
+    riesgo: str,
+    resumen_usuario: List[str],
+    urls_detectadas: List[str],
+    archivo_info: Optional[Dict[str, Any]],
+) -> List[str]:
+    visibles = []
+
+    if riesgo == "alto":
+        visibles.append("Se detectaron varias señales de riesgo en este correo.")
+    elif riesgo == "medio":
+        visibles.append("Se detectaron algunas señales que ameritan precaución.")
+    else:
+        visibles.append("No se detectaron señales fuertes de riesgo, pero conviene revisar el mensaje.")
+
+    for linea in resumen_usuario:
+        if linea not in visibles:
+            visibles.append(linea)
+
+    if urls_detectadas:
+        visibles.append("Los detalles técnicos de enlaces y análisis externos están disponibles en Ver detalles.")
+
+    if archivo_info:
+        visibles.append("Los detalles técnicos del archivo adjunto están disponibles en Ver detalles.")
+
+    return visibles[:5]
+
+
+async def extraer_datos_desde_archivo_correo(archivo: Optional[UploadFile]) -> Optional[Dict[str, Any]]:
+    if not archivo or not archivo.filename:
+        return None
+
+    filename = archivo.filename.lower().strip()
+    contenido = await archivo.read()
+    await archivo.seek(0)
+
+    if filename.endswith(".eml"):
+        return extraer_texto_eml_desde_bytes(contenido)
+
+    if filename.endswith(".msg"):
+        return extraer_texto_msg_desde_bytes(contenido)
+
+    return None
+
+
+async def validar_archivo(archivo: Optional[UploadFile]) -> Optional[Dict[str, Any]]:
+    if not archivo or not archivo.filename:
+        return None
+
+    filename = archivo.filename.strip()
+    filename_lower = filename.lower()
+
+    extension = ""
+    if "." in filename_lower:
+        extension = "." + filename_lower.split(".")[-1]
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Tipo de archivo no permitido. Solo se aceptan PDF, JPG, JPEG, PNG, EML o MSG."
+        )
+
+    content_type = (archivo.content_type or "").lower().strip()
+    if content_type and content_type not in ALLOWED_CONTENT_TYPES:
+        if extension != ".msg":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tipo MIME no permitido: {content_type}"
+            )
+
+    contenido = await archivo.read()
+    tamano = len(contenido)
+
+    if tamano > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo excede el tamaño máximo permitido de 5 MB."
+        )
+
+    await archivo.seek(0)
+
+    return {
+        "filename": filename,
+        "content_type": content_type,
+        "size_bytes": tamano,
+        "extension": extension,
+    }
+
+
 @app.get("/")
 async def root():
     return {"mensaje": "API de análisis de correos funcionando"}
@@ -877,12 +808,12 @@ async def analizar_correo(
 
         if u_lower.startswith("http://"):
             puntos += 2
-            motivos.append(f"La URL {u} usa http en lugar de https.")
+            motivos.append(f"La URL {recortar_texto(u, 120)} usa http en lugar de https.")
 
         if any(p in u_lower for p in ["login", "verifica", "cuenta", "confirm"]):
             puntos += 2
             motivos.append(
-                f"La URL {u} parece relacionada con inicio de sesión, verificación o confirmación."
+                f"La URL {recortar_texto(u, 120)} parece relacionada con inicio de sesión, verificación o confirmación."
             )
 
     for dominio in dominios_detectados:
@@ -944,10 +875,28 @@ async def analizar_correo(
             "No se detectaron señales fuertes, pero siempre verifica con atención, sobre todo si hay enlaces o adjuntos."
         )
 
+    resumen_usuario = generar_resumen_usuario(
+        riesgo=riesgo,
+        remitente=remitente_limpio,
+        urls_detectadas=urls_detectadas,
+        archivo_info=archivo_info,
+        archivo_extraido=archivo_extraido,
+        puntos=puntos,
+    )
+
+    motivos_visibles = construir_motivos_visibles(
+        riesgo=riesgo,
+        resumen_usuario=resumen_usuario,
+        urls_detectadas=urls_detectadas,
+        archivo_info=archivo_info,
+    )
+
     return {
         "riesgo": riesgo,
-        "motivos": motivos,
+        "resumen_usuario": resumen_usuario,
+        "motivos": motivos_visibles,
         "debug": {
+            "motivos_completos": motivos,
             "urls_detectadas": urls_detectadas,
             "dominios_detectados": sorted(list(dominios_detectados)),
             "vt_urls": debug_vt_urls,
