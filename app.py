@@ -810,9 +810,9 @@ def generar_recomendaciones(riesgo: str) -> List[str]:
 
     if riesgo == "medio":
         return [
-            "El correo no muestra señales concluyentes de amenaza, pero valida si realmente necesitas hacer clic en los enlaces.",
+            "El correo requiere validación antes de hacer clic en enlaces o abrir archivos adjuntos.",
             "Para mayor seguridad, confirma el mensaje con el remitente o con el equipo de tecnología.",
-            "No compartas credenciales ni datos sensibles sin validación previa."
+            "No compartas credenciales ni datos sensibles hasta validar su legitimidad."
         ]
 
     return [
