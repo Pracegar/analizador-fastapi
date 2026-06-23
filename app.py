@@ -4,6 +4,8 @@ from typing import Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urlparse
 from email import message_from_bytes
 from email.policy import default
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
 import tempfile
 import os
@@ -11,6 +13,7 @@ import time
 import base64
 import requests
 import re
+import smtplib
 
 try:
     import extract_msg
@@ -36,6 +39,14 @@ app.add_middleware(
 VT_API_KEY = (os.getenv("VIRUSTOTAL_API_KEY") or "").strip()
 URLSCAN_API_KEY = (os.getenv("URLSCAN_API_KEY") or "").strip()
 
+SMTP_HOST = (os.getenv("SMTP_HOST") or "smtp.office365.com").strip()
+SMTP_PORT = int((os.getenv("SMTP_PORT") or "587").strip())
+SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
+SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
+
+ADMIN_EMAIL_1 = (os.getenv("ADMIN_EMAIL_1") or "").strip()
+ADMIN_EMAIL_2 = (os.getenv("ADMIN_EMAIL_2") or "").strip()
+
 MAX_FILE_SIZE = 5 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".eml", ".msg"}
@@ -49,7 +60,6 @@ ALLOWED_CONTENT_TYPES = {
     "application/octet-stream",
 }
 
-# Sesiones HTTP globales para reutilizar conexiones
 session_vt = requests.Session()
 session_urlscan = requests.Session()
 
@@ -218,13 +228,7 @@ def extraer_texto_eml_desde_bytes(contenido: bytes) -> Dict[str, Any]:
         resultado["body"] = body
 
         urls_texto = extraer_urls(
-            " ".join(
-                [
-                    resultado["subject"],
-                    resultado["from"],
-                    resultado["body"],
-                ]
-            )
+            " ".join([resultado["subject"], resultado["from"], resultado["body"]])
         )
 
         urls_finales = []
@@ -280,13 +284,7 @@ def extraer_texto_msg_desde_bytes(contenido: bytes) -> Dict[str, Any]:
         resultado["body"] = str(getattr(msg, "body", "") or "").strip()
 
         urls_texto = extraer_urls(
-            " ".join(
-                [
-                    resultado["subject"],
-                    resultado["from"],
-                    resultado["body"],
-                ]
-            )
+            " ".join([resultado["subject"], resultado["from"], resultado["body"]])
         )
 
         resultado["urls"] = urls_texto
@@ -318,10 +316,6 @@ def extraer_texto_msg_desde_bytes(contenido: bytes) -> Dict[str, Any]:
 async def leer_y_validar_archivo(
     archivo: Optional[UploadFile],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[bytes]]:
-    """
-    Lee el archivo UNA vez, valida y si es .eml/.msg extrae datos.
-    Devuelve: (info_archivo, datos_extraidos_correo, contenido_bytes)
-    """
     if not archivo or not archivo.filename:
         return None, None, None
 
@@ -335,7 +329,7 @@ async def leer_y_validar_archivo(
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Tipo de archivo no permitido. Solo se aceptan PDF, JPG, JPEG, PNG, EML o MSG.",
+            detail="Tipo de archivo no permitido. Solo se aceptan PDF, JPG, JPEG, PNG, EML o MSG."
         )
 
     content_type = (archivo.content_type or "").lower().strip()
@@ -343,7 +337,7 @@ async def leer_y_validar_archivo(
         if extension != ".msg":
             raise HTTPException(
                 status_code=400,
-                detail=f"Tipo MIME no permitido: {content_type}",
+                detail=f"Tipo MIME no permitido: {content_type}"
             )
 
     contenido = await archivo.read()
@@ -354,7 +348,7 @@ async def leer_y_validar_archivo(
     if tamano > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=400,
-            detail="El archivo excede el tamaño máximo permitido de 5 MB.",
+            detail="El archivo excede el tamaño máximo permitido de 5 MB."
         )
 
     archivo_info = {
@@ -387,10 +381,7 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
         resultado["detalle"] = "No existe VIRUSTOTAL_API_KEY en variables de entorno."
         return resultado
 
-    headers = {
-        "x-apikey": VT_API_KEY,
-        "accept": "application/json",
-    }
+    headers = {"x-apikey": VT_API_KEY, "accept": "application/json"}
 
     try:
         submit = session_vt.post(
@@ -439,7 +430,6 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
                         f"VirusTotal marcó la URL como sospechosa en {suspicious} motores."
                     )
                 else:
-                    resultado["risk_points"] = 0
                     resultado["motivos"].append(
                         f"VirusTotal respondió sin detecciones claras para la URL (harmless: {harmless}, undetected: {undetected})."
                     )
@@ -470,10 +460,7 @@ def analizar_dominio_con_virustotal(dominio: str) -> Dict[str, Any]:
         resultado["detalle"] = "No existe VIRUSTOTAL_API_KEY en variables de entorno."
         return resultado
 
-    headers = {
-        "x-apikey": VT_API_KEY,
-        "accept": "application/json",
-    }
+    headers = {"x-apikey": VT_API_KEY, "accept": "application/json"}
 
     try:
         resp = session_vt.get(
@@ -511,7 +498,6 @@ def analizar_dominio_con_virustotal(dominio: str) -> Dict[str, Any]:
                 f"VirusTotal marcó el dominio {dominio} como sospechoso en {suspicious} motores."
             )
         else:
-            resultado["risk_points"] = 0
             resultado["motivos"].append(
                 f"VirusTotal respondió sin detecciones claras para el dominio {dominio} (harmless: {harmless}, undetected: {undetected})."
             )
@@ -547,10 +533,7 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
         submit = session_urlscan.post(
             "https://urlscan.io/api/v1/scan/",
             headers=headers,
-            json={
-                "url": url,
-                "visibility": "public",
-            },
+            json={"url": url, "visibility": "public"},
             timeout=15,
         )
 
@@ -598,7 +581,6 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
                         f"urlscan.io detectó señales de riesgo en la página (score {score})."
                     )
                 else:
-                    resultado["risk_points"] = 0
                     resultado["motivos"].append(
                         "urlscan.io respondió sin señales fuertes de riesgo."
                     )
@@ -624,10 +606,6 @@ async def analizar_archivo_con_virustotal(
     archivo: UploadFile,
     contenido: bytes,
 ) -> Dict[str, Any]:
-    """
-    Analiza archivo con VT usando los bytes ya leídos.
-    Se acorta el polling para no bloquear tanto el request.
-    """
     resultado = {
         "usada": False,
         "ok": False,
@@ -645,10 +623,7 @@ async def analizar_archivo_con_virustotal(
         resultado["detalle"] = "No existe VIRUSTOTAL_API_KEY en variables de entorno."
         return resultado
 
-    headers = {
-        "x-apikey": VT_API_KEY,
-        "accept": "application/json",
-    }
+    headers = {"x-apikey": VT_API_KEY, "accept": "application/json"}
 
     try:
         files = {
@@ -694,8 +669,7 @@ async def analizar_archivo_con_virustotal(
 
             if analysis_resp.status_code != 200:
                 resultado["detalle"] = (
-                    f"VirusTotal devolvió status {analysis_resp.status_code} al consultar "
-                    f"el análisis del archivo."
+                    f"VirusTotal devolvió status {analysis_resp.status_code} al consultar el análisis del archivo."
                 )
                 return resultado
 
@@ -713,8 +687,7 @@ async def analizar_archivo_con_virustotal(
 
                 if item_resp.status_code != 200:
                     resultado["detalle"] = (
-                        "VirusTotal completó el análisis del archivo, pero no devolvió "
-                        "el reporte final."
+                        "VirusTotal completó el análisis del archivo, pero no devolvió el reporte final."
                     )
                     return resultado
 
@@ -743,10 +716,8 @@ async def analizar_archivo_con_virustotal(
                         f"VirusTotal marcó el archivo como sospechoso en {suspicious} motores."
                     )
                 else:
-                    resultado["risk_points"] = 0
                     resultado["motivos"].append(
-                        f"VirusTotal respondió sin detecciones claras para el archivo "
-                        f"(harmless: {harmless}, undetected: {undetected})."
+                        f"VirusTotal respondió sin detecciones claras para el archivo (harmless: {harmless}, undetected: {undetected})."
                     )
 
                 return resultado
@@ -765,9 +736,7 @@ async def analizar_archivo_con_virustotal(
                 )
                 return resultado
 
-            resultado["detalle"] = (
-                f"VirusTotal devolvió un estado no esperado para el archivo: {status}"
-            )
+            resultado["detalle"] = f"VirusTotal devolvió un estado no esperado para el archivo: {status}"
             return resultado
 
         resultado["detalle"] = "VirusTotal no devolvió un resultado final para el archivo."
@@ -800,7 +769,6 @@ def generar_resumen_usuario(
 
     if urls_detectadas:
         resumen.append("Se detectaron enlaces dentro del correo o del archivo adjunto.")
-
         if any(any(p in u.lower() for p in ["login", "verifica", "cuenta", "confirm"]) for u in urls_detectadas):
             resumen.append("Al menos uno de los enlaces parece estar relacionado con acceso, confirmación o verificación.")
 
@@ -821,25 +789,115 @@ def generar_recomendaciones(riesgo: str) -> List[str]:
         return [
             "No hagas clic en enlaces ni abras archivos adjuntos sin validación previa.",
             "No compartas contraseñas, códigos, datos bancarios ni información sensible.",
-            "Reporta el correo al equipo de tecnología o seguridad para revisión.",
+            "Reporta el correo al equipo de tecnología o seguridad para revisión."
         ]
 
     if riesgo == "medio":
         return [
             "El correo requiere validación antes de hacer clic en enlaces o abrir archivos adjuntos.",
             "Para mayor seguridad, confirma el mensaje con el remitente o con el equipo de tecnología.",
-            "No compartas credenciales ni datos sensibles hasta validar su legitimidad.",
+            "No compartas credenciales ni datos sensibles hasta validar su legitimidad."
         ]
 
     return [
         "El correo parece de bajo riesgo, pero revisa si la solicitud es esperada y coherente con tu trabajo.",
         "Si contiene enlaces o archivos, ábrelos solo si reconoces el contexto y el remitente.",
-        "Si tienes dudas, valida con el remitente o con el equipo de tecnología.",
+        "Si tienes dudas, valida con el remitente o con el equipo de tecnología."
     ]
 
 
 def construir_motivos_visibles(resumen_usuario: List[str]) -> List[str]:
     return resumen_usuario[:4]
+
+
+def enviar_reporte_por_correo(
+    riesgo: str,
+    resumen_usuario: List[str],
+    recomendaciones: List[str],
+    debug: Dict[str, Any],
+    remitente_analizado: str = "",
+    asunto_analizado: str = "",
+):
+    destinatarios = [x for x in [ADMIN_EMAIL_1, ADMIN_EMAIL_2] if x]
+
+    if not destinatarios:
+        raise RuntimeError("No hay destinatarios administradores configurados.")
+
+    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS):
+        raise RuntimeError("Configuración SMTP incompleta en variables de entorno.")
+
+    asunto_email = f"Reporte análisis de correo sospechoso - Riesgo: {riesgo.upper()}"
+
+    resumen_txt = "\n".join(f"- {item}" for item in resumen_usuario)
+    recomendaciones_txt = "\n".join(f"- {item}" for item in recomendaciones)
+
+    archivo_info = debug.get("archivo_info") or {}
+    urls = debug.get("urls_detectadas") or []
+    dominios = debug.get("dominios_detectados") or []
+    puntos_totales = debug.get("puntos_totales")
+    motivos_completos = debug.get("motivos_completos") or []
+
+    detalles = []
+
+    if remitente_analizado:
+        detalles.append(f"Remitente analizado: {remitente_analizado}")
+
+    if asunto_analizado:
+        detalles.append(f"Asunto analizado: {asunto_analizado}")
+
+    if archivo_info:
+        detalles.append(
+            f'Archivo adjunto: {archivo_info.get("filename", "N/A")} ({archivo_info.get("size_bytes", 0)} bytes)'
+        )
+
+    if urls:
+        detalles.append("URLs detectadas:")
+        for u in urls[:10]:
+            detalles.append(f"  - {u}")
+
+    if dominios:
+        detalles.append("Dominios detectados:")
+        for d in dominios:
+            detalles.append(f"  - {d}")
+
+    if puntos_totales is not None:
+        detalles.append(f"Puntaje total de riesgo interno: {puntos_totales}")
+
+    if motivos_completos:
+        detalles.append("Motivos del análisis:")
+        for m in motivos_completos[:15]:
+            detalles.append(f"  - {m}")
+
+    cuerpo = f"""
+Este es el reporte automático del análisis de un correo sospechoso.
+
+Nivel de riesgo estimado: {riesgo.upper()}
+
+RESUMEN PRINCIPAL:
+{resumen_txt}
+
+RECOMENDACIONES:
+{recomendaciones_txt}
+
+DETALLES TÉCNICOS:
+{chr(10).join(detalles) if detalles else "Sin detalles técnicos adicionales."}
+
+---
+Mensaje generado automáticamente por el analizador de correos.
+"""
+
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_USER
+    msg["To"] = ", ".join(destinatarios)
+    msg["Subject"] = asunto_email
+    msg.attach(MIMEText(cuerpo.strip(), "plain", "utf-8"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, destinatarios, msg.as_string())
 
 
 @app.get("/")
@@ -985,37 +1043,20 @@ async def analizar_correo(
                 f"La URL {recortar_texto(u)} parece relacionada con inicio de sesión, verificación o confirmación."
             )
 
-    # Consultas a VT dominio (siguen siendo secuenciales pero con connection pooling)
     for dominio in dominios_detectados:
         vt_dominio = analizar_dominio_con_virustotal(dominio)
-        debug_vt_dominios.append(
-            {
-                "dominio": dominio,
-                "resultado": vt_dominio,
-            }
-        )
+        debug_vt_dominios.append({"dominio": dominio, "resultado": vt_dominio})
         motivos.extend(vt_dominio.get("motivos", []))
         puntos += vt_dominio.get("risk_points", 0)
 
-    # Consultas a VT y urlscan para URLs (también secuenciales pero más rápidas por Session y timeouts)
     for u in urls_detectadas:
         vt_url = analizar_url_con_virustotal(u)
-        debug_vt_urls.append(
-            {
-                "url": u,
-                "resultado": vt_url,
-            }
-        )
+        debug_vt_urls.append({"url": u, "resultado": vt_url})
         motivos.extend(vt_url.get("motivos", []))
         puntos += vt_url.get("risk_points", 0)
 
         urlscan_url = analizar_url_con_urlscan(u)
-        debug_urlscan_urls.append(
-            {
-                "url": u,
-                "resultado": urlscan_url,
-            }
-        )
+        debug_urlscan_urls.append({"url": u, "resultado": urlscan_url})
         motivos.extend(urlscan_url.get("motivos", []))
         puntos += urlscan_url.get("risk_points", 0)
 
@@ -1069,25 +1110,43 @@ async def analizar_correo(
     recomendaciones = generar_recomendaciones(riesgo)
     motivos_visibles = construir_motivos_visibles(resumen_usuario)
 
+    debug = {
+        "motivos_completos": motivos,
+        "urls_detectadas": urls_detectadas,
+        "dominios_detectados": sorted(list(dominios_detectados)),
+        "vt_urls": debug_vt_urls,
+        "vt_dominios": debug_vt_dominios,
+        "urlscan_urls": debug_urlscan_urls,
+        "vt_archivo": debug_vt_archivo,
+        "archivo_extraido": debug_archivo_extraido,
+        "vt_key_cargada": bool(VT_API_KEY),
+        "urlscan_key_cargada": bool(URLSCAN_API_KEY),
+        "archivo_info": archivo_info,
+        "puntos_totales": puntos,
+        "hay_url_sensible": hay_url_sensible,
+        "analisis_parcial_archivo": analisis_parcial_archivo,
+        "destinatarios_admin_configurados": [x for x in [ADMIN_EMAIL_1, ADMIN_EMAIL_2] if x],
+    }
+
+    try:
+        enviar_reporte_por_correo(
+            riesgo=riesgo,
+            resumen_usuario=resumen_usuario,
+            recomendaciones=recomendaciones,
+            debug=debug,
+            remitente_analizado=remitente_limpio,
+            asunto_analizado=asunto_limpio,
+        )
+        debug["correo_enviado"] = True
+        debug["destinatarios_admin"] = [x for x in [ADMIN_EMAIL_1, ADMIN_EMAIL_2] if x]
+    except Exception as e:
+        debug["correo_enviado"] = False
+        debug["error_envio_correo"] = str(e)
+
     return {
         "riesgo": riesgo,
         "resumen_usuario": resumen_usuario,
         "recomendaciones": recomendaciones,
         "motivos": motivos_visibles,
-        "debug": {
-            "motivos_completos": motivos,
-            "urls_detectadas": urls_detectadas,
-            "dominios_detectados": sorted(list(dominios_detectados)),
-            "vt_urls": debug_vt_urls,
-            "vt_dominios": debug_vt_dominios,
-            "urlscan_urls": debug_urlscan_urls,
-            "vt_archivo": debug_vt_archivo,
-            "archivo_extraido": debug_archivo_extraido,
-            "vt_key_cargada": bool(VT_API_KEY),
-            "urlscan_key_cargada": bool(URLSCAN_API_KEY),
-            "archivo_info": archivo_info,
-            "puntos_totales": puntos,
-            "hay_url_sensible": hay_url_sensible,
-            "analisis_parcial_archivo": analisis_parcial_archivo,
-        },
+        "debug": debug,
     }
