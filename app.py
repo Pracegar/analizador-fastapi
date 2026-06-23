@@ -792,7 +792,7 @@ def generar_resumen_usuario(
             resumen.append("Al menos uno de los enlaces parece estar relacionado con acceso, confirmación o verificación.")
 
     if archivo_info:
-        resumen.append(f"Se analizó un archivo adjunto válido: {archivo_info.get('filename', 'archivo')}.")
+        resumen.append(f"Se analizó el archivo adjunto: {archivo_info.get('filename', 'archivo')}.")
 
     if puntos >= 6:
         resumen.append("Se recomienda no abrir enlaces ni adjuntos hasta confirmar la legitimidad del mensaje.")
@@ -822,9 +822,7 @@ def generar_recomendaciones(riesgo: str) -> List[str]:
     ]
 
 
-def construir_motivos_visibles(
-    resumen_usuario: List[str]
-) -> List[str]:
+def construir_motivos_visibles(resumen_usuario: List[str]) -> List[str]:
     return resumen_usuario[:4]
 
 
@@ -1004,12 +1002,20 @@ async def analizar_correo(
             if archivo_extraido.get("from"):
                 motivos.append("Se extrajo información del remitente desde el archivo adjunto.")
 
+    hay_url_sensible = any(
+        any(p in u.lower() for p in ["login", "verifica", "cuenta", "confirm"])
+        for u in urls_detectadas
+    )
+
     if puntos <= 2:
         riesgo = "bajo"
     elif puntos <= 5:
         riesgo = "medio"
     else:
         riesgo = "alto"
+
+    if hay_url_sensible and riesgo == "bajo":
+        riesgo = "medio"
 
     if not motivos:
         motivos.append(
@@ -1045,5 +1051,6 @@ async def analizar_correo(
             "urlscan_key_cargada": bool(URLSCAN_API_KEY),
             "archivo_info": archivo_info,
             "puntos_totales": puntos,
+            "hay_url_sensible": hay_url_sensible,
         },
     }
