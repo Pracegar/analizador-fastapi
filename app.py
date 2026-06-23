@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urlparse
 from email import message_from_bytes
 from email.policy import default
@@ -48,6 +48,10 @@ ALLOWED_CONTENT_TYPES = {
     "application/vnd.ms-outlook",
     "application/octet-stream",
 }
+
+# Sesiones HTTP globales para reutilizar conexiones
+session_vt = requests.Session()
+session_urlscan = requests.Session()
 
 
 def obtener_url_id_vt(url: str) -> str:
@@ -311,26 +315,15 @@ def extraer_texto_msg_desde_bytes(contenido: bytes) -> Dict[str, Any]:
                 pass
 
 
-async def extraer_datos_desde_archivo_correo(archivo: Optional[UploadFile]) -> Optional[Dict[str, Any]]:
+async def leer_y_validar_archivo(
+    archivo: Optional[UploadFile],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[bytes]]:
+    """
+    Lee el archivo UNA vez, valida y si es .eml/.msg extrae datos.
+    Devuelve: (info_archivo, datos_extraidos_correo, contenido_bytes)
+    """
     if not archivo or not archivo.filename:
-        return None
-
-    filename = archivo.filename.lower().strip()
-    contenido = await archivo.read()
-    await archivo.seek(0)
-
-    if filename.endswith(".eml"):
-        return extraer_texto_eml_desde_bytes(contenido)
-
-    if filename.endswith(".msg"):
-        return extraer_texto_msg_desde_bytes(contenido)
-
-    return None
-
-
-async def validar_archivo(archivo: Optional[UploadFile]) -> Optional[Dict[str, Any]]:
-    if not archivo or not archivo.filename:
-        return None
+        return None, None, None
 
     filename = archivo.filename.strip()
     filename_lower = filename.lower()
@@ -342,7 +335,7 @@ async def validar_archivo(archivo: Optional[UploadFile]) -> Optional[Dict[str, A
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Tipo de archivo no permitido. Solo se aceptan PDF, JPG, JPEG, PNG, EML o MSG."
+            detail="Tipo de archivo no permitido. Solo se aceptan PDF, JPG, JPEG, PNG, EML o MSG.",
         )
 
     content_type = (archivo.content_type or "").lower().strip()
@@ -350,26 +343,34 @@ async def validar_archivo(archivo: Optional[UploadFile]) -> Optional[Dict[str, A
         if extension != ".msg":
             raise HTTPException(
                 status_code=400,
-                detail=f"Tipo MIME no permitido: {content_type}"
+                detail=f"Tipo MIME no permitido: {content_type}",
             )
 
     contenido = await archivo.read()
+    await archivo.seek(0)
+
     tamano = len(contenido)
 
     if tamano > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=400,
-            detail="El archivo excede el tamaño máximo permitido de 5 MB."
+            detail="El archivo excede el tamaño máximo permitido de 5 MB.",
         )
 
-    await archivo.seek(0)
-
-    return {
+    archivo_info = {
         "filename": filename,
         "content_type": content_type,
         "size_bytes": tamano,
         "extension": extension,
     }
+
+    extraido = None
+    if extension == ".eml":
+        extraido = extraer_texto_eml_desde_bytes(contenido)
+    elif extension == ".msg":
+        extraido = extraer_texto_msg_desde_bytes(contenido)
+
+    return archivo_info, extraido, contenido
 
 
 def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
@@ -392,11 +393,11 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
     }
 
     try:
-        submit = requests.post(
+        submit = session_vt.post(
             "https://www.virustotal.com/api/v3/urls",
             headers=headers,
             data={"url": url},
-            timeout=30,
+            timeout=15,
         )
 
         resultado["usada"] = True
@@ -407,11 +408,11 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
 
         url_id = obtener_url_id_vt(url)
 
-        for _ in range(5):
-            report = requests.get(
+        for _ in range(3):
+            report = session_vt.get(
                 f"https://www.virustotal.com/api/v3/urls/{url_id}",
                 headers=headers,
-                timeout=30,
+                timeout=10,
             )
 
             if report.status_code == 200:
@@ -445,7 +446,7 @@ def analizar_url_con_virustotal(url: str) -> Dict[str, Any]:
 
                 return resultado
 
-            time.sleep(3)
+            time.sleep(2)
 
         resultado["detalle"] = "VirusTotal aceptó la URL, pero no devolvió reporte listo a tiempo."
         return resultado
@@ -475,10 +476,10 @@ def analizar_dominio_con_virustotal(dominio: str) -> Dict[str, Any]:
     }
 
     try:
-        resp = requests.get(
+        resp = session_vt.get(
             f"https://www.virustotal.com/api/v3/domains/{dominio}",
             headers=headers,
-            timeout=30,
+            timeout=15,
         )
 
         resultado["usada"] = True
@@ -543,14 +544,14 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
     }
 
     try:
-        submit = requests.post(
+        submit = session_urlscan.post(
             "https://urlscan.io/api/v1/scan/",
             headers=headers,
             json={
                 "url": url,
                 "visibility": "public",
             },
-            timeout=30,
+            timeout=15,
         )
 
         resultado["usada"] = True
@@ -567,11 +568,11 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
             resultado["detalle"] = "urlscan.io no devolvió UUID."
             return resultado
 
-        for _ in range(8):
-            result = requests.get(
+        for _ in range(5):
+            result = session_urlscan.get(
                 f"https://urlscan.io/api/v1/result/{uuid}/",
                 headers={"API-Key": URLSCAN_API_KEY},
-                timeout=30,
+                timeout=10,
             )
 
             if result.status_code == 200:
@@ -609,7 +610,7 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
 
                 return resultado
 
-            time.sleep(5)
+            time.sleep(3)
 
         resultado["detalle"] = "urlscan.io aceptó la URL, pero no devolvió resultado listo a tiempo."
         return resultado
@@ -619,7 +620,14 @@ def analizar_url_con_urlscan(url: str) -> Dict[str, Any]:
         return resultado
 
 
-async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]:
+async def analizar_archivo_con_virustotal(
+    archivo: UploadFile,
+    contenido: bytes,
+) -> Dict[str, Any]:
+    """
+    Analiza archivo con VT usando los bytes ya leídos.
+    Se acorta el polling para no bloquear tanto el request.
+    """
     resultado = {
         "usada": False,
         "ok": False,
@@ -643,9 +651,6 @@ async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]
     }
 
     try:
-        contenido = await archivo.read()
-        await archivo.seek(0)
-
         files = {
             "file": (
                 archivo.filename,
@@ -654,11 +659,11 @@ async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]
             )
         }
 
-        submit = requests.post(
+        submit = session_vt.post(
             "https://www.virustotal.com/api/v3/files",
             headers=headers,
             files=files,
-            timeout=60,
+            timeout=40,
         )
 
         resultado["usada"] = True
@@ -675,16 +680,16 @@ async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]
             resultado["detalle"] = "VirusTotal no devolvió analysis_id para el archivo."
             return resultado
 
-        max_intentos = 15
-        espera_segundos = 6
+        max_intentos = 8
+        espera_segundos = 4
 
         for intento in range(1, max_intentos + 1):
             resultado["intentos"] = intento
 
-            analysis_resp = requests.get(
+            analysis_resp = session_vt.get(
                 f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
                 headers=headers,
-                timeout=30,
+                timeout=15,
             )
 
             if analysis_resp.status_code != 200:
@@ -700,10 +705,10 @@ async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]
             resultado["status"] = status
 
             if status == "completed":
-                item_resp = requests.get(
+                item_resp = session_vt.get(
                     f"https://www.virustotal.com/api/v3/analyses/{analysis_id}/item",
                     headers=headers,
-                    timeout=30,
+                    timeout=15,
                 )
 
                 if item_resp.status_code != 200:
@@ -816,20 +821,20 @@ def generar_recomendaciones(riesgo: str) -> List[str]:
         return [
             "No hagas clic en enlaces ni abras archivos adjuntos sin validación previa.",
             "No compartas contraseñas, códigos, datos bancarios ni información sensible.",
-            "Reporta el correo al equipo de tecnología o seguridad para revisión."
+            "Reporta el correo al equipo de tecnología o seguridad para revisión.",
         ]
 
     if riesgo == "medio":
         return [
             "El correo requiere validación antes de hacer clic en enlaces o abrir archivos adjuntos.",
             "Para mayor seguridad, confirma el mensaje con el remitente o con el equipo de tecnología.",
-            "No compartas credenciales ni datos sensibles hasta validar su legitimidad."
+            "No compartas credenciales ni datos sensibles hasta validar su legitimidad.",
         ]
 
     return [
         "El correo parece de bajo riesgo, pero revisa si la solicitud es esperada y coherente con tu trabajo.",
         "Si contiene enlaces o archivos, ábrelos solo si reconoces el contexto y el remitente.",
-        "Si tienes dudas, valida con el remitente o con el equipo de tecnología."
+        "Si tienes dudas, valida con el remitente o con el equipo de tecnología.",
     ]
 
 
@@ -869,8 +874,7 @@ async def analizar_correo(
     cuerpo_limpio = (cuerpo or "").strip()
     url_limpia = normalizar_url((url or "").strip()) if url else ""
 
-    archivo_info = await validar_archivo(archivo)
-    archivo_extraido = await extraer_datos_desde_archivo_correo(archivo)
+    archivo_info, archivo_extraido, contenido_archivo = await leer_y_validar_archivo(archivo)
     debug_archivo_extraido = archivo_extraido
 
     analisis_parcial_archivo = False
@@ -981,6 +985,7 @@ async def analizar_correo(
                 f"La URL {recortar_texto(u)} parece relacionada con inicio de sesión, verificación o confirmación."
             )
 
+    # Consultas a VT dominio (siguen siendo secuenciales pero con connection pooling)
     for dominio in dominios_detectados:
         vt_dominio = analizar_dominio_con_virustotal(dominio)
         debug_vt_dominios.append(
@@ -992,6 +997,7 @@ async def analizar_correo(
         motivos.extend(vt_dominio.get("motivos", []))
         puntos += vt_dominio.get("risk_points", 0)
 
+    # Consultas a VT y urlscan para URLs (también secuenciales pero más rápidas por Session y timeouts)
     for u in urls_detectadas:
         vt_url = analizar_url_con_virustotal(u)
         debug_vt_urls.append(
@@ -1013,8 +1019,8 @@ async def analizar_correo(
         motivos.extend(urlscan_url.get("motivos", []))
         puntos += urlscan_url.get("risk_points", 0)
 
-    if archivo_info and archivo:
-        vt_archivo = await analizar_archivo_con_virustotal(archivo)
+    if archivo_info and archivo and contenido_archivo is not None:
+        vt_archivo = await analizar_archivo_con_virustotal(archivo, contenido_archivo)
         debug_vt_archivo = vt_archivo
         motivos.append(f"Hay un archivo adjunto válido ({archivo_info['filename']}).")
         motivos.extend(vt_archivo.get("motivos", []))
