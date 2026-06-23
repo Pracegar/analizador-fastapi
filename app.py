@@ -144,6 +144,13 @@ def limpiar_texto_html(texto: str) -> str:
     return texto.strip()
 
 
+def recortar_texto(texto: str, max_len: int = 120) -> str:
+    texto = (texto or "").strip()
+    if len(texto) <= max_len:
+        return texto
+    return texto[:max_len].rstrip() + "..."
+
+
 def extraer_texto_eml_desde_bytes(contenido: bytes) -> Dict[str, Any]:
     resultado = {
         "subject": "",
@@ -759,6 +766,68 @@ async def analizar_archivo_con_virustotal(archivo: UploadFile) -> Dict[str, Any]
         return resultado
 
 
+def generar_resumen_usuario(
+    riesgo: str,
+    puntos: int,
+    remitente_externo: bool,
+    urls_detectadas: List[str],
+    archivo_info: Optional[Dict[str, Any]],
+) -> List[str]:
+    resumen = []
+
+    if riesgo == "alto":
+        resumen.append("El correo presenta varias señales de alerta y debe tratarse como sospechoso.")
+    elif riesgo == "medio":
+        resumen.append("El correo presenta algunas señales de precaución y conviene validarlo antes de interactuar con su contenido.")
+    else:
+        resumen.append("No se detectaron señales fuertes de riesgo en el análisis realizado.")
+
+    if remitente_externo:
+        resumen.append("El remitente no pertenece a un dominio interno de la organización.")
+
+    if urls_detectadas:
+        resumen.append("Se detectaron enlaces dentro del correo o del archivo adjunto.")
+
+        if any(any(p in u.lower() for p in ["login", "verifica", "cuenta", "confirm"]) for u in urls_detectadas):
+            resumen.append("Al menos uno de los enlaces parece estar relacionado con acceso, confirmación o verificación.")
+
+    if archivo_info:
+        resumen.append(f"Se analizó un archivo adjunto válido: {archivo_info.get('filename', 'archivo')}.")
+
+    if puntos >= 6:
+        resumen.append("Se recomienda no abrir enlaces ni adjuntos hasta confirmar la legitimidad del mensaje.")
+
+    return resumen[:5]
+
+
+def generar_recomendaciones(riesgo: str) -> List[str]:
+    if riesgo == "alto":
+        return [
+            "No hagas clic en enlaces ni abras archivos adjuntos sin validación previa.",
+            "No compartas contraseñas, códigos, datos bancarios ni información sensible.",
+            "Reporta el correo al equipo de tecnología o seguridad para revisión."
+        ]
+
+    if riesgo == "medio":
+        return [
+            "El correo no muestra señales concluyentes de amenaza, pero valida si realmente necesitas hacer clic en los enlaces.",
+            "Para mayor seguridad, confirma el mensaje con el remitente o con el equipo de tecnología.",
+            "No compartas credenciales ni datos sensibles sin validación previa."
+        ]
+
+    return [
+        "El correo parece de bajo riesgo, pero revisa si la solicitud es esperada y coherente con tu trabajo.",
+        "Si contiene enlaces o archivos, ábrelos solo si reconoces el contexto y el remitente.",
+        "Si tienes dudas, valida con el remitente o con el equipo de tecnología."
+    ]
+
+
+def construir_motivos_visibles(
+    resumen_usuario: List[str]
+) -> List[str]:
+    return resumen_usuario[:4]
+
+
 @app.get("/")
 async def root():
     return {"mensaje": "API de análisis de correos funcionando"}
@@ -810,10 +879,13 @@ async def analizar_correo(
             cuerpo_limpio = cuerpo_extraido
 
     dominio_remitente = extraer_dominio_de_email(remitente_limpio)
+    remitente_externo = False
+
     if dominio_remitente:
         dominios_detectados.add(dominio_remitente)
 
         if dominio_remitente not in dominios_internos:
+            remitente_externo = True
             puntos += 2
             motivos.append("El remitente no parece ser del dominio de la empresa.")
 
@@ -832,7 +904,7 @@ async def analizar_correo(
         if any(p in asunto_lower for p in palabras_peligrosas):
             puntos += 2
             motivos.append(
-                "El asunto contiene palabras de urgencia o relacionadas con pagos/seguridad."
+                "El asunto contiene palabras de urgencia o relacionadas con pagos o seguridad."
             )
 
     if cuerpo_limpio:
@@ -847,7 +919,7 @@ async def analizar_correo(
         ):
             puntos += 3
             motivos.append(
-                "El cuerpo menciona cambios de cuenta o datos financieros/sensibles."
+                "El cuerpo menciona cambios de cuenta o datos financieros o sensibles."
             )
 
     if url_limpia:
@@ -877,12 +949,12 @@ async def analizar_correo(
 
         if u_lower.startswith("http://"):
             puntos += 2
-            motivos.append(f"La URL {u} usa http en lugar de https.")
+            motivos.append(f"La URL {recortar_texto(u)} usa http en lugar de https.")
 
         if any(p in u_lower for p in ["login", "verifica", "cuenta", "confirm"]):
             puntos += 2
             motivos.append(
-                f"La URL {u} parece relacionada con inicio de sesión, verificación o confirmación."
+                f"La URL {recortar_texto(u)} parece relacionada con inicio de sesión, verificación o confirmación."
             )
 
     for dominio in dominios_detectados:
@@ -944,10 +1016,24 @@ async def analizar_correo(
             "No se detectaron señales fuertes, pero siempre verifica con atención, sobre todo si hay enlaces o adjuntos."
         )
 
+    resumen_usuario = generar_resumen_usuario(
+        riesgo=riesgo,
+        puntos=puntos,
+        remitente_externo=remitente_externo,
+        urls_detectadas=urls_detectadas,
+        archivo_info=archivo_info,
+    )
+
+    recomendaciones = generar_recomendaciones(riesgo)
+    motivos_visibles = construir_motivos_visibles(resumen_usuario)
+
     return {
         "riesgo": riesgo,
-        "motivos": motivos,
+        "resumen_usuario": resumen_usuario,
+        "recomendaciones": recomendaciones,
+        "motivos": motivos_visibles,
         "debug": {
+            "motivos_completos": motivos,
             "urls_detectadas": urls_detectadas,
             "dominios_detectados": sorted(list(dominios_detectados)),
             "vt_urls": debug_vt_urls,
