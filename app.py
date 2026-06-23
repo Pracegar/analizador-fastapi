@@ -160,6 +160,21 @@ def extraer_texto_eml_desde_bytes(contenido: bytes) -> Dict[str, Any]:
         "dominios": [],
     }
 
+    def decodificar_parte(part) -> str:
+        try:
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                contenido_simple = part.get_content()
+                return str(contenido_simple or "").strip()
+
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                return payload.decode(charset, errors="replace").strip()
+            except Exception:
+                return payload.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
     try:
         msg = message_from_bytes(contenido, policy=default)
         resultado["subject"] = str(msg.get("subject") or "").strip()
@@ -176,32 +191,24 @@ def extraer_texto_eml_desde_bytes(contenido: bytes) -> Dict[str, Any]:
                 if "attachment" in disposition:
                     continue
 
-                try:
-                    if content_type == "text/plain":
-                        texto = part.get_content()
-                        if texto:
-                            partes_texto.append(str(texto))
+                if content_type == "text/plain":
+                    texto = decodificar_parte(part)
+                    if texto:
+                        partes_texto.append(texto)
 
-                    elif content_type == "text/html":
-                        html = part.get_content()
-                        if html:
-                            html_str = str(html)
-                            partes_texto.append(limpiar_texto_html(html_str))
-                            urls_html.extend(extraer_links_html(html_str))
-                except Exception:
-                    continue
+                elif content_type == "text/html":
+                    html = decodificar_parte(part)
+                    if html:
+                        partes_texto.append(limpiar_texto_html(html))
+                        urls_html.extend(extraer_links_html(html))
         else:
-            try:
-                contenido_simple = msg.get_content()
-                if contenido_simple:
-                    if msg.get_content_type() == "text/html":
-                        html_str = str(contenido_simple)
-                        partes_texto.append(limpiar_texto_html(html_str))
-                        urls_html.extend(extraer_links_html(html_str))
-                    else:
-                        partes_texto.append(str(contenido_simple))
-            except Exception:
-                pass
+            contenido_simple = decodificar_parte(msg)
+            if contenido_simple:
+                if msg.get_content_type() == "text/html":
+                    partes_texto.append(limpiar_texto_html(contenido_simple))
+                    urls_html.extend(extraer_links_html(contenido_simple))
+                else:
+                    partes_texto.append(contenido_simple)
 
         body = "\n".join([p for p in partes_texto if p]).strip()
         resultado["body"] = body
@@ -772,6 +779,7 @@ def generar_resumen_usuario(
     remitente_externo: bool,
     urls_detectadas: List[str],
     archivo_info: Optional[Dict[str, Any]],
+    analisis_parcial_archivo: bool,
 ) -> List[str]:
     resumen = []
 
@@ -792,7 +800,10 @@ def generar_resumen_usuario(
             resumen.append("Al menos uno de los enlaces parece estar relacionado con acceso, confirmación o verificación.")
 
     if archivo_info:
-        resumen.append(f"Se analizó el archivo adjunto: {archivo_info.get('filename', 'archivo')}.")
+        resumen.append(f'Se analizó el archivo adjunto "{archivo_info.get("filename", "archivo")}".')
+
+    if analisis_parcial_archivo:
+        resumen.append("El archivo adjunto contenía información limitada, por lo que el análisis fue parcial.")
 
     if puntos >= 6:
         resumen.append("Se recomienda no abrir enlaces ni adjuntos hasta confirmar la legitimidad del mensaje.")
@@ -861,6 +872,21 @@ async def analizar_correo(
     archivo_info = await validar_archivo(archivo)
     archivo_extraido = await extraer_datos_desde_archivo_correo(archivo)
     debug_archivo_extraido = archivo_extraido
+
+    analisis_parcial_archivo = False
+
+    if archivo_info and archivo_extraido:
+        sin_from = not (archivo_extraido.get("from") or "").strip()
+        sin_subject = not (archivo_extraido.get("subject") or "").strip()
+        sin_body = not (archivo_extraido.get("body") or "").strip()
+        sin_urls = not archivo_extraido.get("urls")
+
+        if sin_from and sin_subject and sin_body and sin_urls:
+            analisis_parcial_archivo = True
+            motivos.append(
+                "El archivo adjunto fue recibido, pero no contenía suficiente información analizable."
+            )
+            puntos += 1
 
     if archivo_extraido:
         remitente_extraido = (archivo_extraido.get("from") or "").strip()
@@ -1017,6 +1043,9 @@ async def analizar_correo(
     if hay_url_sensible and riesgo == "bajo":
         riesgo = "medio"
 
+    if analisis_parcial_archivo and riesgo == "bajo":
+        riesgo = "medio"
+
     if not motivos:
         motivos.append(
             "No se detectaron señales fuertes, pero siempre verifica con atención, sobre todo si hay enlaces o adjuntos."
@@ -1028,6 +1057,7 @@ async def analizar_correo(
         remitente_externo=remitente_externo,
         urls_detectadas=urls_detectadas,
         archivo_info=archivo_info,
+        analisis_parcial_archivo=analisis_parcial_archivo,
     )
 
     recomendaciones = generar_recomendaciones(riesgo)
@@ -1052,5 +1082,6 @@ async def analizar_correo(
             "archivo_info": archivo_info,
             "puntos_totales": puntos,
             "hay_url_sensible": hay_url_sensible,
+            "analisis_parcial_archivo": analisis_parcial_archivo,
         },
     }
